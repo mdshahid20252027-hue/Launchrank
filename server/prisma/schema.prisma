@@ -1,0 +1,63 @@
+generator client { provider = "prisma-client-js" }
+datasource db { provider = "postgresql" url = env("DATABASE_URL") }
+enum Role { USER ADMIN }
+enum ProductStatus { PENDING APPROVED REJECTED }
+enum PaymentStatus { CREATED PAID FAILED REFUNDED }
+model User {
+ id String @id @default(cuid())
+ name String
+ email String @unique
+ passwordHash String
+ role Role @default(USER)
+ products Product[]
+ votes Vote[]
+ orders Order[]
+ createdAt DateTime @default(now())
+}
+model Product {
+ id String @id @default(cuid())
+ name String
+ slug String @unique
+ tagline String
+ description String
+ websiteUrl String
+ category String
+ status ProductStatus @default(PENDING)
+ ownerId String
+ owner User @relation(fields:[ownerId],references:[id],onDelete:Cascade)
+ votes Vote[]
+ promotions Promotion[]
+ orders Order[]
+ createdAt DateTime @default(now())
+ @@index([status,createdAt])
+}
+model Vote {
+ id String @id @default(cuid())
+ userId String
+ productId String
+ user User @relation(fields:[userId],references:[id],onDelete:Cascade)
+ product Product @relation(fields:[productId],references:[id],onDelete:Cascade)
+ createdAt DateTime @default(now())
+ @@unique([userId,productId])
+}
+model Promotion {
+ id String @id @default(cuid())
+ productId String
+ product Product @relation(fields:[productId],references:[id],onDelete:Cascade)
+ startsAt DateTime
+ endsAt DateTime
+ active Boolean @default(false)
+ createdAt DateTime @default(now())
+}
+model Order {
+ id String @id @default(cuid())
+ userId String
+ user User @relation(fields:[userId],references:[id])
+ productId String
+ product Product @relation(fields:[productId],references:[id],onDelete:Cascade)
+ amountPaise Int
+ razorpayOrderId String? @unique
+ razorpayPaymentId String? @unique
+ status PaymentStatus @default(CREATED)
+ createdAt DateTime @default(now())
+}
