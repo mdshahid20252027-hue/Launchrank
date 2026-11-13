@@ -13,29 +13,10 @@ import { prisma } from './db.js';
 import { auth, admin } from './middleware.js';
 
 const app = express();
-app.use(helmet({
-  contentSecurityPolicy: {
-    directives: {
-      defaultSrc: ["'self'"],
-      scriptSrc: ["'self'", 'https://checkout.razorpay.com'],
-      connectSrc: ["'self'", 'https://api.razorpay.com'],
-      frameSrc: ["'self'", 'https://api.razorpay.com', 'https://checkout.razorpay.com'],
-      imgSrc: ["'self'", 'data:', 'https:'],
-      styleSrc: ["'self'", "'unsafe-inline'"],
-    },
-  },
-}));
+app.use(helmet());
 app.use(cors({ origin: process.env.CLIENT_URL || 'http://localhost:5173', credentials: true }));
 app.use(express.json({ limit: '1mb', verify: (req: any, _res, buf) => { req.rawBody = Buffer.from(buf); } }));
 app.use(cookieParser());
-app.use((req, res, next) => {
-  if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method) && req.path !== '/api/webhooks/razorpay') {
-    const origin = req.header('origin');
-    const allowedOrigin = process.env.CLIENT_URL || 'http://localhost:5173';
-    if (origin && origin !== allowedOrigin) return res.status(403).json({ message: 'Request origin not allowed' });
-  }
-  next();
-});
 
 // In production, use HTTPS and a frontend/backend deployment on trusted origins.
 const cookie = {
@@ -51,7 +32,6 @@ const include = { owner: { select: { id: true, name: true } }, _count: { select:
 const shape = (product: any) => ({ ...product, voteCount: product._count.votes, _count: undefined });
 
 app.get('/api/health', (_req: Request, res: Response) => res.json({ status: 'ok' }));
-app.use('/api', rateLimit({ windowMs: 15 * 60 * 1000, limit: 300, standardHeaders: 'draft-7', legacyHeaders: false }));
 
 app.post('/api/auth/register', rateLimit({ windowMs: 900000, limit: 20 }), wrap(async (req, res) => {
   const parsed = z.object({ name: z.string().min(2).max(60), email: z.string().email(), password: z.string().min(8).max(100) }).safeParse(req.body);
@@ -140,16 +120,6 @@ app.get('/api/users/me/products', auth, wrap(async (req, res) => {
   res.json({ products: products.map(shape) });
 }));
 
-app.get('/api/users/me/votes', auth, wrap(async (req, res) => {
-  const votes = await prisma.vote.findMany({
-    where: { userId: (req as any).user.id },
-    include: { product: { include } },
-    orderBy: { createdAt: 'desc' },
-    take: 100,
-  });
-  res.json({ votes: votes.map(vote => ({ ...vote, product: shape(vote.product) })) });
-}));
-
 app.get('/api/admin/products/pending', auth, admin, wrap(async (_req, res) => {
   const products = await prisma.product.findMany({ where: { status: 'PENDING' }, include });
   res.json({ products: products.map(shape) });
@@ -181,85 +151,28 @@ app.post('/api/payments/verify', auth, wrap(async (req, res) => {
   const expected = crypto.createHmac('sha256', process.env.RAZORPAY_KEY_SECRET).update(data.razorpay_order_id + '|' + data.razorpay_payment_id).digest('hex');
   const expectedBuffer = Buffer.from(expected); const receivedBuffer = Buffer.from(data.razorpay_signature);
   if (expectedBuffer.length !== receivedBuffer.length || !crypto.timingSafeEqual(expectedBuffer, receivedBuffer)) return res.status(400).json({ message: 'Signature verification failed' });
-
-  const existing = await prisma.order.findFirst({ where: { razorpayOrderId: data.razorpay_order_id, userId: (req as any).user.id } });
-  if (!existing) return res.status(404).json({ message: 'Order not found' });
-  if (existing.status === 'PAID' && existing.razorpayPaymentId === data.razorpay_payment_id) {
-    return res.json({ message: 'Payment already verified. Promotion is active.' });
-  }
-  if (existing.status !== 'CREATED') return res.status(409).json({ message: 'This order has already been processed' });
-
+  const order = await prisma.order.findFirst({ where: { razorpayOrderId: data.razorpay_order_id, userId: (req as any).user.id, status: 'CREATED' } });
+  if (!order) return res.status(404).json({ message: 'Order not found/already processed' });
   const razorpay = new Razorpay({ key_id: process.env.RAZORPAY_KEY_ID, key_secret: process.env.RAZORPAY_KEY_SECRET });
   const payment: any = await razorpay.payments.fetch(data.razorpay_payment_id);
-  if (payment.order_id !== data.razorpay_order_id || payment.amount !== existing.amountPaise || payment.currency !== 'INR' || payment.status !== 'captured') {
+  if (payment.order_id !== data.razorpay_order_id || payment.amount !== order.amountPaise || payment.currency !== 'INR' || payment.status !== 'captured') {
     return res.status(400).json({ message: 'Payment is not captured or amount does not match' });
   }
-  const days = existing.amountPaise === 9900 ? 1 : existing.amountPaise === 49900 ? 7 : 0;
+  const days = order.amountPaise === 9900 ? 1 : order.amountPaise === 49900 ? 7 : 0;
   if (!days) return res.status(400).json({ message: 'Unknown payment package amount' });
-  await prisma.$transaction(async tx => {
-    const changed = await tx.order.updateMany({
-      where: { id: existing.id, status: 'CREATED' },
-      data: { status: 'PAID', razorpayPaymentId: data.razorpay_payment_id },
-    });
-    if (changed.count === 1) {
-      await tx.promotion.create({ data: { productId: existing.productId, startsAt: new Date(), endsAt: new Date(Date.now() + days * 86400000), active: true } });
-    }
-  });
-  const finalOrder = await prisma.order.findUnique({ where: { id: existing.id } });
-  if (finalOrder?.status !== 'PAID' || finalOrder.razorpayPaymentId !== data.razorpay_payment_id) {
-    return res.status(409).json({ message: 'Payment is being processed. Refresh your dashboard shortly.' });
-  }
+  await prisma.$transaction([
+    prisma.order.update({ where: { id: order.id }, data: { status: 'PAID' } }),
+    prisma.promotion.create({ data: { productId: order.productId, startsAt: new Date(), endsAt: new Date(Date.now() + days * 86400000), active: true } }),
+  ]);
   res.json({ message: 'Payment verified. Promotion activated.' });
 }));
 app.post('/api/webhooks/razorpay', wrap(async (req, res) => {
   const secret = process.env.RAZORPAY_WEBHOOK_SECRET;
   if (!secret) return res.status(503).json({ message: 'Webhook not configured' });
   const signature = req.header('x-razorpay-signature') || '';
-  const rawBody = (req as any).rawBody as Buffer | undefined;
-  if (!rawBody) return res.status(400).json({ message: 'Missing raw webhook body' });
-  const expected = crypto.createHmac('sha256', secret).update(rawBody).digest('hex');
+  const expected = crypto.createHmac('sha256', secret).update((req as any).rawBody).digest('hex');
   const a = Buffer.from(expected); const b = Buffer.from(signature);
   if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return res.status(400).json({ message: 'Invalid webhook signature' });
-
-  const event = req.body?.event;
-  const payment = req.body?.payload?.payment?.entity;
-  if (payment?.order_id && event === 'payment.captured') {
-    const order = await prisma.order.findFirst({ where: { razorpayOrderId: payment.order_id } });
-    if (order && payment.amount === order.amountPaise && payment.currency === 'INR' && payment.status === 'captured') {
-      const days = order.amountPaise === 9900 ? 1 : order.amountPaise === 49900 ? 7 : 0;
-      if (days) {
-        await prisma.$transaction(async tx => {
-          const changed = await tx.order.updateMany({
-            where: { id: order.id, status: 'CREATED' },
-            data: { status: 'PAID', razorpayPaymentId: payment.id },
-          });
-          if (changed.count === 1) {
-            await tx.promotion.create({ data: { productId: order.productId, startsAt: new Date(), endsAt: new Date(Date.now() + days * 86400000), active: true } });
-          }
-        });
-      }
-    }
-  } else if (payment?.order_id && event === 'payment.failed') {
-    await prisma.order.updateMany({
-      where: { razorpayOrderId: payment.order_id, status: 'CREATED' },
-      data: { status: 'FAILED', ...(payment.id ? { razorpayPaymentId: payment.id } : {}) },
-    });
-  } else if (event === 'refund.processed') {
-    const refund = req.body?.payload?.refund?.entity;
-    if (refund?.payment_id && typeof refund.amount === 'number') {
-      const paidOrder = await prisma.order.findFirst({ where: { razorpayPaymentId: refund.payment_id, status: 'PAID' } });
-      // Only a full refund reverses the promotion; partial refunds keep the purchased placement active.
-      if (paidOrder && refund.amount >= paidOrder.amountPaise) {
-        await prisma.$transaction([
-          prisma.order.updateMany({ where: { id: paidOrder.id, status: 'PAID' }, data: { status: 'REFUNDED' } }),
-          prisma.promotion.updateMany({
-            where: { product: { orders: { some: { id: paidOrder.id } } }, active: true },
-            data: { active: false },
-          }),
-        ]);
-      }
-    }
-  }
   res.json({ received: true });
 }));
 
