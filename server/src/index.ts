@@ -1,3 +1,4 @@
+
 import 'dotenv/config';
 import express, { type Request, type Response, type NextFunction } from 'express';
 import cors from 'cors';
@@ -11,6 +12,7 @@ import Razorpay from 'razorpay';
 import { z } from 'zod';
 import { prisma } from './db.js';
 import { auth, admin } from './middleware.js';
+
 
 const app = express();
 app.use(helmet());
