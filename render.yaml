@@ -2,7 +2,7 @@ databases:
   - name: launchrank-db
     databaseName: launchrank
     user: launchrank
-    plan: basic
+    plan: basic-256mb
 
 services:
   - type: web
