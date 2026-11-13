@@ -2,13 +2,13 @@ databases:
   - name: launchrank-db
     databaseName: launchrank
     user: launchrank
-    plan: basic-256mb
+    plan: free
 
 services:
   - type: web
     name: launchrank-api
     runtime: node
-    plan: starter
+    plan: free
     buildCommand: npm ci && npm run build
     startCommand: npm run start --workspace server
     healthCheckPath: /api/health
